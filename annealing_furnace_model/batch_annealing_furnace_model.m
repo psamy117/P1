@@ -257,7 +257,7 @@ fprintf('Mixed fuel gas consumed over %.0f h cycle: %.0f Nm^3 (peak firing %.0f 
 figure('Name','Furnace & Atmosphere Temperatures','Color','w');
 plot(t_hr, T_cover, 'r-', 'LineWidth', 1.8); hold on;
 plot(t_hr, T_gas, 'b-', 'LineWidth', 1.8);
-yline(T_anneal_C, 'k--', 'Anneal target');
+plot(xlim, [T_anneal_C T_anneal_C], 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
 xlabel('Time [h]'); ylabel('Temperature [C]');
 legend('Cover (muffle)','H_2 atmosphere','Location','SouthEast');
 title('Cover and H_2 Atmosphere Temperature'); grid on;
@@ -270,7 +270,7 @@ title('Mixed Fuel Gas Firing Rate (cover temperature controller)'); grid on;
 figure('Name','Coil Core & Surface Temperatures','Color','w');
 subplot(2,1,1);
 plot(t_hr, T_core, 'LineWidth', 1.5); hold on;
-yline(T_anneal_C, 'k--');
+plot(xlim, [T_anneal_C T_anneal_C], 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
 xlabel('Time [h]'); ylabel('Core temp [C]');
 title('Coil CORE Temperature (innermost radial node) - all 5 stack positions');
 legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), ...
@@ -279,7 +279,7 @@ grid on;
 
 subplot(2,1,2);
 plot(t_hr, T_surf, 'LineWidth', 1.5); hold on;
-yline(T_anneal_C, 'k--');
+plot(xlim, [T_anneal_C T_anneal_C], 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
 xlabel('Time [h]'); ylabel('Surface temp [C]');
 title('Coil SURFACE Temperature (outermost radial node)');
 legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), ...
