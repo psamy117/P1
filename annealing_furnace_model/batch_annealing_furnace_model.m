@@ -71,8 +71,13 @@
 %  (PNG + editable FIG) and the script pauses at the end waiting for
 %  Enter, so results survive even if launched in a way that auto-exits
 %  MATLAB right after the script finishes.
+%
+%  NOTE: this script does NOT close any pre-existing figure windows, so
+%  results from earlier runs (e.g. with different coil inputs) stay on
+%  screen for comparison. Close old figure windows yourself if you want a
+%  clean slate before the next run.
 
-clear; clc; close all;
+clear; clc;
 
 %% =====================================================================
 %  1) FURNACE / STACK GEOMETRY (fixed by problem statement)
@@ -445,11 +450,12 @@ title(sprintf('Coil 1: 2D Temperature Field at End of Soak [C] (t=%.1f h)', t_hr
 drawnow;
 outdir = fullfile(pwd, 'furnace_results');
 if ~exist(outdir, 'dir'), mkdir(outdir); end
-saveas(fig1, fullfile(outdir, 'full_annealing_cycle.png'));
-saveas(fig2, fullfile(outdir, 'coil_2d_temperature_field.png'));
-saveas(fig1, fullfile(outdir, 'full_annealing_cycle.fig'));
-saveas(fig2, fullfile(outdir, 'coil_2d_temperature_field.fig'));
-fprintf('\nFigures saved to: %s\n', outdir);
+run_tag = datestr(now, 'yyyymmdd_HHMMSS');   %#ok<TNOW1,DATST> % unique per run, so repeat runs don't overwrite each other's saved files
+saveas(fig1, fullfile(outdir, ['full_annealing_cycle_' run_tag '.png']));
+saveas(fig2, fullfile(outdir, ['coil_2d_temperature_field_' run_tag '.png']));
+saveas(fig1, fullfile(outdir, ['full_annealing_cycle_' run_tag '.fig']));
+saveas(fig2, fullfile(outdir, ['coil_2d_temperature_field_' run_tag '.fig']));
+fprintf('\nFigures saved to: %s (tagged %s)\n', outdir, run_tag);
 
 % In non-interactive execution (matlab -batch, many online/cloud MATLAB
 % runners, CI) there is no persistent desktop to keep alive - the session
