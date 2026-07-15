@@ -451,7 +451,16 @@ saveas(fig1, fullfile(outdir, 'full_annealing_cycle.fig'));
 saveas(fig2, fullfile(outdir, 'coil_2d_temperature_field.fig'));
 fprintf('\nFigures saved to: %s\n', outdir);
 
-input('\nPress Enter in this window to close... (figures are already saved to disk above)', 's');
+% In non-interactive execution (matlab -batch, many online/cloud MATLAB
+% runners, CI) there is no persistent desktop to keep alive - the session
+% tears down the instant the script returns, and input() itself throws an
+% error in that mode. Catch that so the run still ends cleanly instead of
+% erroring out; the PNG/FIG files above are the real deliverable there.
+try
+    input('\nPress Enter in this window to close... (figures are already saved to disk above)', 's');
+catch
+    fprintf('\n(Non-interactive session detected - skipping the pause. Open the PNG/FIG files in %s to view the results.)\n', outdir);
+end
 
 %% =====================================================================
 %  LOCAL FUNCTIONS
