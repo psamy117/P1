@@ -2,9 +2,33 @@
 %
 %  Bell-type batch annealing furnace, coil-on-coil (base + convector plates),
 %  combustion-heated inner cover ("muffle") fired on MIXED FUEL GAS, with a
-%  fan-circulated HYDROGEN atmosphere used purely as the convective heat
-%  transfer medium between the cover and the coil stack (classic HICON/H2
-%  type batch annealing furnace).
+%  fan-circulated 100% HYDROGEN atmosphere (true H2 BAF, NOT the older HNx
+%  mix of ~7% H2 / 93% N2) used purely as the convective heat transfer
+%  medium between the cover and the coil stack.
+%
+%  Model structure follows Fang & Wu, "Batch Annealing Model for Cold
+%  Rolled Coils and Its Application", China Steel Technical Report No. 28,
+%  pp.13-20 (2015) - the HeatMod-based simulation model China Steel
+%  Corporation developed for their H2 BAF:
+%   - Coil conduction solved via Fourier's equation in cylindrical
+%     coordinates (their Eq. 1), radial-only here (axisymmetric per coil).
+%   - Cover-to-atmosphere convection Q = A*alpha*(T1-T2) (their Eq. 2).
+%   - Cover-to-coil radiation Q = A*F*eps*sigma*(Tcover^4 - Tcoilsurface^4)
+%     (their Eq. 4) - implemented here in the algebraically equivalent
+%     LINEARISED form h_rad*(Tcover-Tsurf), with
+%     h_rad = eps*sigma*(Tcover^2+Tsurf^2)*(Tcover+Tsurf).
+%   - Same "cold spot" (innermost/slowest-heating node) and "hot spot"
+%     (outer surface, fastest-heating node) terminology as the paper -
+%     the paper found the FURNACE BASE TEMPERATURE is NOT a precise proxy
+%     for cold-spot temperature (17-46 C lower), so - as in the paper -
+%     the coil's own cold-spot temperature is what actually ends each
+%     stage here, not the cover/base temperature.
+%   - Same 3-stage HEAT -> SOAK -> COOL control logic as the paper's
+%     Fig.5 flowcharts, including a RAPID COOLING switch once the
+%     atmosphere gas temperature drops below a threshold (Fig.5b: "If gas
+%     temperature < setpoint - rapid cooling, then change the heat
+%     transfer parameters") - modelled here as a step increase in
+%     circulation once that threshold is crossed.
 %
 %  Physics modelled:
 %   1) Cover (muffle) energy balance: heated by mixed-gas combustion,
@@ -15,18 +39,20 @@
 %      fan circulation) -> solved as a quasi-steady energy balance between
 %      what it picks up from the cover and what it gives up to the coils.
 %   3) Each of the N_COILS stacked coils: 1-D transient radial conduction
-%      (cylindrical coordinates) from the coil ID (insulated core / eye)
-%      out to its own OD, which sees convection from the H2 atmosphere and
-%      radiation from the cover. Radial conduction uses an EFFECTIVE radial
-%      conductivity that accounts for the stack of wrap-to-wrap air gaps in
-%      a coil of wound strip - this is what makes strip THICKNESS matter
-%      for the heating rate (thinner strip = more interfaces per metre of
-%      radius = lower effective conductivity = slower core heating).
-%   4) THREE-STAGE cycle: HEAT (burner drives the cover setpoint up at the
+%      (cylindrical coordinates) from the coil ID/COLD SPOT (insulated
+%      core / eye) out to its own OD/HOT SPOT, which sees convection from
+%      the H2 atmosphere and radiation from the cover. Radial conduction
+%      uses an EFFECTIVE radial conductivity that accounts for the stack
+%      of wrap-to-wrap air gaps in a coil of wound strip - this is what
+%      makes strip THICKNESS matter for the heating rate (thinner strip =
+%      more interfaces per metre of radius = lower effective conductivity
+%      = slower cold-spot heating).
+%   4) FOUR-STAGE cycle: HEAT (burner drives the cover setpoint up at the
 %      requested HEATING RATE, capped at target+margin, until the slowest
-%      coil's core reaches ITS OWN target) -> SOAK (hold at temperature for
-%      a fixed dwell) -> COOL (burner off, stack cools through the same
-%      convective/radiative paths).
+%      coil's cold spot reaches ITS OWN target) -> SOAK (hold at
+%      temperature for a fixed dwell) -> COOL (burner off) -> RAPID COOL
+%      (once atmosphere gas temperature drops below a threshold, emulating
+%      the paper's cooling-hood/forced-circulation switch).
 %
 %  EACH of the 5 stacked coils gets its OWN thickness, width and annealing
 %  target - prompted interactively below, coil-by-coil from the furnace
@@ -37,8 +63,8 @@
 %  the ramp rate is a shared process parameter, not per-coil).
 %
 %  All other quantities are engineering-typical defaults for a mixed-gas
-%  fired / H2-convection batch annealing furnace and are clearly marked
-%  "ADVANCED PARAMETERS" - edit them if you have plant-specific data.
+%  fired / 100% H2-convection batch annealing furnace and are clearly
+%  marked "ADVANCED PARAMETERS" - edit them if you have plant-specific data.
 %
 %  Requires: base MATLAB only (ode15s) - no toolboxes.
 %
@@ -169,6 +195,16 @@ soak_margin_C       = 15;     % SOAK cover setpoint margin - much smaller,
 tol_C               = 5;      % "at temperature" tolerance, deg C
 
 % --- H2 atmosphere / convection ---------------------------------------
+% Atmosphere is 100% HYDROGEN (a true H2 BAF, per Fang & Wu 2015 - NOT the
+% older HNx mix of ~7% H2/93% N2 their model was originally derived from).
+% Pure H2's much higher thermal conductivity and lower density vs. HNx or
+% N2 is exactly why H2 BAFs achieve materially higher convective h and
+% shorter cycles - the gas property function below (h2_properties) uses
+% pure-H2 correlations throughout, not a mixture rule.
+atmosphere_H2_fraction = 1.00;     % 1.00 = 100% H2 (this model assumes pure
+                                    % H2 gas properties end-to-end; it is
+                                    % NOT parameterised for HNx/N2 mixtures)
+
 % Heat transfer coefficient is modelled as JET IMPINGEMENT through the
 % perforated convector plates that sit between the coils (this is how
 % HICON/H2-type furnaces actually drive gas onto the coil faces - not
@@ -185,6 +221,10 @@ M_H2           = 2.016e-3;    % kg/mol
 Rg             = 8.314;       % J/mol/K
 cp_H2          = 14300;       % J/kg/K (~constant over anneal temp range)
 
+if atmosphere_H2_fraction ~= 1.00
+    warning('atmosphere_H2_fraction is set to %.2f but this model only implements pure-H2 (100%%) gas properties - the H2 fraction value itself has no effect on the calculation.', atmosphere_H2_fraction);
+end
+
 % Simple stack-position factor: hearth/burner-side coils tend to run a
 % touch hotter than the top (closer to the cold lid / seal) in a real
 % furnace even with convector plates - included only for realism in the
@@ -199,6 +239,16 @@ heat_search_hr = 150;   % safety cap: stop the heat-up search if not all
                         % coils reach target by this time (should not be hit)
 soak_time_hr   = 6;     % hold time once the slowest coil reaches target
 cool_time_hr   = 20;    % simulated cooling duration after soak
+
+% --- Rapid cooling switch (per Fang & Wu 2015, Fig.5b) -----------------
+% Their cooling flowchart explicitly checks "if gas temperature < setpoint
+% - rapid cooling, then change the heat transfer parameters" - i.e. once
+% the atmosphere has cooled enough (no more oxidation/distortion risk),
+% circulation is stepped up (cooling hood / higher fan speed) to shorten
+% the remainder of the cool-down. Modelled here as a step increase in fan
+% flow once the atmosphere gas temperature drops below the trigger.
+rapid_cool_trigger_C  = 400;   % gas temp below which rapid cooling engages
+rapid_cool_fan_factor = 1.8;   % fan flow multiplier once engaged
 
 %% =====================================================================
 %  4) CHECK STACK HEIGHT FITS THE 7 m FURNACE
@@ -277,7 +327,8 @@ params = struct('Nr',Nr,'n_coils',n_coils,'A_coil3',A_coil3,'flux_ratio',flux_ra
     'd_nozzle_m',d_nozzle_m,'open_area_frac',open_area_frac, ...
     'M_H2',M_H2,'Rg',Rg,'cp_H2',cp_H2, ...
     'T_anneal_C',T_anneal_C,'tol_C',tol_C,'phase','heat', ...
-    'heating_rate_C_per_hr',heating_rate_C_per_hr);
+    'heating_rate_C_per_hr',heating_rate_C_per_hr, ...
+    'rapid_cool_trigger_C',rapid_cool_trigger_C,'rapid_cool_fan_factor',rapid_cool_fan_factor);
 
 opts_heat = odeset('RelTol',1e-6,'AbsTol',1e-4, ...
     'Events', @(t,y) all_reached_event(t,y,params));
@@ -336,6 +387,7 @@ T_surf  = squeeze(coils(:,Nr,:));    % outermost node (coil OD)
 T_gas = zeros(size(t));
 Q_fuel_kW = zeros(size(t));
 T_cover_setpoint = zeros(size(t));   % for plotting the commanded ramp/hold
+rapid_cool_active = false(size(t));  % marks when the rapid-cool switch is engaged
 for k = 1:length(t)
     if t(k) <= t_heat_end
         phase_k = 'heat';
@@ -346,6 +398,12 @@ for k = 1:length(t)
     end
     pk = params; pk.phase = phase_k;
     [~, T_gas(k)] = gas_temp_and_h(T_cover(k), T_surf(k,:), pk);
+    if strcmp(phase_k,'cool') && T_gas(k) < pk.rapid_cool_trigger_C
+        pk_rapid = pk;
+        pk_rapid.Q_fan_m3s = pk.Q_fan_m3s * pk.rapid_cool_fan_factor;
+        [~, T_gas(k)] = gas_temp_and_h(T_cover(k), T_surf(k,:), pk_rapid);
+        rapid_cool_active(k) = true;
+    end
     switch phase_k
         case 'cool'
             Q_fuel_kW(k) = 0;
@@ -369,21 +427,28 @@ fprintf('\n--- Results ---\n');
 for c = 1:n_coils
     idx = find(T_core(:,c) >= T_anneal_C(c) - tol_C, 1, 'first');
     if isempty(idx)
-        fprintf('Coil %d: core did NOT reach its %.0f C target within the simulated cycle\n', c, T_anneal_C(c));
+        fprintf('Coil %d: cold spot did NOT reach its %.0f C target within the simulated cycle\n', c, T_anneal_C(c));
     else
-        fprintf('Coil %d: core reaches its %.0f C target at t = %.1f h (surface was %.0f C)\n', ...
+        fprintf('Coil %d: cold spot reaches its %.0f C target at t = %.1f h (hot spot was %.0f C)\n', ...
             c, T_anneal_C(c), t_hr(idx), T_surf(idx,c));
     end
 end
 fprintf('\nHeat-up complete : %.1f h\n', t_heat_end/3600);
-fprintf('Soak ends        : %.1f h\n', t_soak_end/3600);
+fprintf('Annealing time (heat+soak) : %.1f h\n', t_soak_end/3600);
+idx_rapid = find(rapid_cool_active, 1, 'first');
+if isempty(idx_rapid)
+    fprintf('Rapid cooling    : never triggered (gas stayed above %.0f C for the simulated cool duration)\n', rapid_cool_trigger_C);
+else
+    fprintf('Rapid cooling engaged at t = %.1f h (gas dropped below %.0f C, fan flow x%.1f)\n', ...
+        t_hr(idx_rapid), rapid_cool_trigger_C, rapid_cool_fan_factor);
+end
 fprintf('Total cycle time : %.1f h (heat %.1f h + soak %.1f h + cool %.1f h)\n', ...
     t_total/3600, t_heat_end/3600, soak_time_hr, cool_time_hr);
 fprintf('Mixed fuel gas consumed over full cycle: %.0f Nm^3 (peak firing %.0f kW)\n', ...
     mixedgas_total_Nm3, max(Q_fuel_kW));
 fprintf('\nRequested furnace heating rate : %.1f C/hr (caps the cover setpoint ramp)\n', heating_rate_C_per_hr);
 for c = 1:n_coils
-    fprintf('Coil %d effective avg. core heating rate: %.1f C/hr (limited by radial conduction, not just the ramp)\n', ...
+    fprintf('Coil %d effective avg. cold-spot heating rate: %.1f C/hr (limited by radial conduction, not just the ramp)\n', ...
         c, (T_anneal_C(c)-T_amb_C)/(t_heat_end/3600));
 end
 
@@ -405,15 +470,15 @@ plot(t_hr, T_core, 'LineWidth', 1.5); hold on;
 for c = 1:n_coils
     plot(xlim, [T_anneal_C(c) T_anneal_C(c)], '--', 'Color', [0.5 0.5 0.5], 'HandleVisibility','off');
 end
-ylabel('Core temp [C]');
+ylabel('Cold spot [C]');
 legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), 'Location','SouthEast');
-title('Coil CORE Temperature (innermost radial node)'); grid on;
+title('Coil COLD SPOT Temperature (innermost radial node)'); grid on;
 
 ax3 = subplot(4,1,3);
 plot(t_hr, T_surf, 'LineWidth', 1.5);
-ylabel('Surface temp [C]');
+ylabel('Hot spot [C]');
 legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), 'Location','SouthEast');
-title('Coil SURFACE Temperature (outermost radial node)'); grid on;
+title('Coil HOT SPOT Temperature (outermost radial node)'); grid on;
 
 ax4 = subplot(4,1,4);
 plot(t_hr, Q_fuel_kW, 'm-', 'LineWidth', 1.8);
@@ -425,6 +490,9 @@ for axh = [ax1 ax2 ax3 ax4]
     hold(axh,'on');
     plot(axh, [t_heat_end t_heat_end]/3600, yl, 'k:', 'HandleVisibility','off');
     plot(axh, [t_soak_end t_soak_end]/3600, yl, 'k:', 'HandleVisibility','off');
+    if ~isempty(idx_rapid)
+        plot(axh, [t_hr(idx_rapid) t_hr(idx_rapid)], yl, 'c:', 'LineWidth', 1.2, 'HandleVisibility','off');
+    end
     set(axh,'YLim',yl);
 end
 linkaxes([ax1 ax2 ax3 ax4],'x');
@@ -472,6 +540,16 @@ function dydt = furnace_odes(t, y, p)
     Tsurf = coils(Nr,:);
 
     [h_conv, T_gas, h_rad] = gas_temp_and_h(T_cover, Tsurf, p);
+
+    % RAPID COOLING switch (Fang & Wu 2015, Fig.5b): once the atmosphere has
+    % cooled below the trigger temperature, circulation is stepped up
+    % (cooling hood / higher fan speed) - re-evaluate h_conv/T_gas/h_rad
+    % with the boosted fan flow for the remainder of the cool phase.
+    if strcmp(p.phase,'cool') && T_gas < p.rapid_cool_trigger_C
+        p_rapid = p;
+        p_rapid.Q_fan_m3s = p.Q_fan_m3s * p.rapid_cool_fan_factor;
+        [h_conv, T_gas, h_rad] = gas_temp_and_h(T_cover, Tsurf, p_rapid);
+    end
 
     % --- Cover (muffle) energy balance ---
     switch p.phase
