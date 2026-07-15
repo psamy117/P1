@@ -1,4 +1,4 @@
-%% BATCH ANNEALING FURNACE - HEAT TRANSFER MODEL
+%% BATCH ANNEALING FURNACE - HEAT TRANSFER MODEL (FULL CYCLE: HEAT + SOAK + COOL)
 %
 %  Bell-type batch annealing furnace, coil-on-coil (base + convector plates),
 %  combustion-heated inner cover ("muffle") fired on MIXED FUEL GAS, with a
@@ -16,48 +16,69 @@
 %      what it picks up from the cover and what it gives up to the coils.
 %   3) Each of the N_COILS stacked coils: 1-D transient radial conduction
 %      (cylindrical coordinates) from the coil ID (insulated core / eye)
-%      out to the coil OD, which sees convection from the H2 atmosphere
-%      and radiation from the cover. Radial conduction uses an EFFECTIVE
-%      radial conductivity that accounts for the stack of wrap-to-wrap air
-%      gaps in a coil of wound strip - this is what makes strip THICKNESS
-%      matter for the heating rate (thinner strip = more interfaces per
-%      metre of radius = lower effective conductivity = slower core heating).
+%      out to its own OD, which sees convection from the H2 atmosphere and
+%      radiation from the cover. Radial conduction uses an EFFECTIVE radial
+%      conductivity that accounts for the stack of wrap-to-wrap air gaps in
+%      a coil of wound strip - this is what makes strip THICKNESS matter
+%      for the heating rate (thinner strip = more interfaces per metre of
+%      radius = lower effective conductivity = slower core heating).
+%   4) THREE-STAGE cycle: HEAT (burner drives cover to setpoint until the
+%      slowest coil's core reaches ITS OWN target) -> SOAK (hold at
+%      temperature for a fixed dwell) -> COOL (burner off, stack cools
+%      through the same convective/radiative paths).
 %
-%  USER INPUTS (thickness, width, annealing temperature) are requested
-%  interactively below. Furnace height is fixed at 7 m and the stack holds
-%  5 coils, per the given furnace design.
+%  EACH of the 5 stacked coils gets its OWN thickness, width and annealing
+%  target - prompted interactively below, coil-by-coil from the furnace
+%  base upward. Furnace height is fixed at 7 m and the stack holds 5 coils,
+%  per the given furnace design.
 %
 %  All other quantities are engineering-typical defaults for a mixed-gas
 %  fired / H2-convection batch annealing furnace and are clearly marked
 %  "ADVANCED PARAMETERS" - edit them if you have plant-specific data.
 %
-%  Requires: Optimization not needed. Uses ode15s (stiff solver) from base
-%  MATLAB - no toolboxes required.
+%  Requires: base MATLAB only (ode15s) - no toolboxes.
 
 clear; clc; close all;
 
 %% =====================================================================
-%  1) USER INPUTS
-%  =====================================================================
-thickness_mm = input('Strip thickness [mm] (e.g. 0.5): ');
-if isempty(thickness_mm), thickness_mm = 0.5; end
-
-width_mm = input('Coil width [mm] (axial length of coil, e.g. 1200): ');
-if isempty(width_mm), width_mm = 1200; end
-
-T_anneal_C = input('Annealing (soak) temperature [deg C] (e.g. 700): ');
-if isempty(T_anneal_C), T_anneal_C = 700; end
-
-fprintf('\n--- Inputs ---\n');
-fprintf('Strip thickness   : %.3f mm\n', thickness_mm);
-fprintf('Coil width        : %.1f mm\n', width_mm);
-fprintf('Annealing temp    : %.1f C\n\n', T_anneal_C);
-
-%% =====================================================================
-%  2) FURNACE / STACK GEOMETRY (fixed by problem statement)
+%  1) FURNACE / STACK GEOMETRY (fixed by problem statement)
 %  =====================================================================
 furnace_height_m = 7.0;     % total inner furnace (base to cover) height
 n_coils          = 5;       % coils stacked base-to-top
+
+%% =====================================================================
+%  2) USER INPUTS - each of the 5 coils gets its own thickness/width/target
+%  =====================================================================
+default_thk_mm = [0.30 0.50 0.70 1.00 1.20];   % illustrative per-coil defaults
+default_wid_mm = [1000 1100 1200 1000  900];
+default_tgt_C  = [680  700  700  720  690];
+
+thickness_mm = zeros(1,n_coils);
+width_mm     = zeros(1,n_coils);
+T_anneal_C   = zeros(1,n_coils);
+
+for c = 1:n_coils
+    fprintf('\n-- Coil %d of %d (stack position, base -> top) --\n', c, n_coils);
+    v = input(sprintf('  Strip thickness [mm] (default %.2f): ', default_thk_mm(c)));
+    if isempty(v), v = default_thk_mm(c); end
+    thickness_mm(c) = v;
+
+    v = input(sprintf('  Coil width [mm] (default %.0f): ', default_wid_mm(c)));
+    if isempty(v), v = default_wid_mm(c); end
+    width_mm(c) = v;
+
+    v = input(sprintf('  Annealing (soak) temperature [C] (default %.0f): ', default_tgt_C(c)));
+    if isempty(v), v = default_tgt_C(c); end
+    T_anneal_C(c) = v;
+end
+
+fprintf('\n--- Inputs summary ---\n');
+fprintf(' Coil | Thickness[mm] | Width[mm] | Target[C]\n');
+for c = 1:n_coils
+    fprintf('  %2d  |     %5.2f     |   %5.0f   |   %5.0f\n', ...
+        c, thickness_mm(c), width_mm(c), T_anneal_C(c));
+end
+fprintf('\n');
 
 thickness_m = thickness_mm/1000;
 width_m     = width_mm/1000;
@@ -67,7 +88,7 @@ width_m     = width_mm/1000;
 %  =====================================================================
 
 % --- Coil geometry / material ---------------------------------------
-coil_ID_m      = 0.850;     % coil eye (inner bore) diameter -> radius below
+coil_ID_m      = 0.850;     % coil eye (inner bore) diameter, same for all coils
 coil_mass_kg   = 20000;     % steel mass per coil (typical ~20 t coil)
 rho_steel      = 7850;      % kg/m^3
 cp_steel       = 490;       % J/kg/K
@@ -77,31 +98,34 @@ R_contact      = 2.2e-4;    % m^2.K/W, wrap-to-wrap contact resistance
                              %  higher tension coils sit lower in this range)
 eps_coil       = 0.55;      % coil (steel strip) surface emissivity
 
-% Effective radial conductivity of the WOUND coil (series-resistance model):
+% Effective radial conductivity of each WOUND coil (series-resistance model):
 %   1/k_eff = 1/k_steel + R_contact/thickness
 % -> thinner strip means more wrap interfaces per metre of radius, so
 %    k_eff drops (slower radial heat penetration to the core).
-k_eff = 1/(1/k_steel + R_contact/thickness_m);
+k_eff = 1./(1/k_steel + R_contact./thickness_m);       % 1 x n_coils
 
-% Coil OD back-calculated from fixed mass, ID and (user) width:
+% Coil OD back-calculated per coil from fixed mass, common ID and own width:
 r_ID = coil_ID_m/2;
-OD_m = sqrt(coil_ID_m^2 + 4*coil_mass_kg/(pi*rho_steel*width_m));
-r_OD = OD_m/2;
+OD_m = sqrt(coil_ID_m^2 + 4*coil_mass_kg./(pi*rho_steel*width_m));   % 1 x n_coils
 
-fprintf('Derived coil geometry: ID = %.3f m, OD = %.3f m, k_eff = %.3f W/m/K\n\n', ...
-    coil_ID_m, OD_m, k_eff);
+fprintf('Derived per-coil geometry:\n');
+fprintf(' Coil |  OD[m] | k_eff[W/m/K]\n');
+for c = 1:n_coils
+    fprintf('  %2d  | %5.3f  |    %5.3f\n', c, OD_m(c), k_eff(c));
+end
+fprintf('\n');
 
 % --- Furnace shell / cover -------------------------------------------
-gap_annulus_m  = 0.30;                 % radial gas gap coil-OD to shell
-D_shell_m      = OD_m + 2*gap_annulus_m;
+gap_annulus_m  = 0.30;                  % radial gas gap, largest coil OD to shell
+D_shell_m      = max(OD_m) + 2*gap_annulus_m;
 A_shell_lat    = pi*D_shell_m*furnace_height_m;      % shell lateral area
-M_cover_kg     = 6000;                 % inner cover (muffle) steel mass
-Cp_cover       = 500;                  % J/kg/K
+M_cover_kg     = 6000;                  % inner cover (muffle) steel mass
+Cp_cover       = 500;                   % J/kg/K
 A_cover        = pi/4*D_shell_m^2*2 + A_shell_lat*0.3; % approx cover heat
-                                        % exchange area (top/bottom + part
-                                        % of the muffle side wall)
-eps_cover      = 0.80;                 % oxidised muffle steel emissivity
-U_loss         = 3.0;                  % W/m^2/K, shell wall loss coeff
+                                         % exchange area (top/bottom + part
+                                         % of the muffle side wall)
+eps_cover      = 0.80;                  % oxidised muffle steel emissivity
+U_loss         = 3.0;                   % W/m^2/K, shell wall loss coeff
 T_amb_C        = 25;
 
 % Effective cover-to-coil radiative emissivity (parallel-plate network)
@@ -113,9 +137,15 @@ LHV_mixedgas_kJ_Nm3 = 5000;   % typical COG/BFG mixed gas calorific value
 eta_comb            = 0.85;   % combustion + heat-transfer-to-cover efficiency
 Q_burner_max_kW     = 2200;   % total installed burner firing capacity
 Kp_cover            = 40;     % kW/K, proportional controller gain
-cover_margin_C      = 60;     % cover setpoint = anneal target + margin
-                               % (standard batch-anneal practice: run the
-                               %  cover hot to drive heat into the coils)
+cover_margin_C      = 60;     % HEAT-UP cover setpoint = hottest coil's target
+                               % + this margin (standard batch-anneal
+                               %  practice: run the cover hot to drive heat
+                               %  into the coils quickly)
+soak_margin_C       = 15;     % SOAK cover setpoint margin - much smaller,
+                               % just enough to offset losses and hold
+                               % coils steady at temperature (not still
+                               %  ramping them up further)
+tol_C               = 5;      % "at temperature" tolerance, deg C
 
 % --- H2 atmosphere / convection ---------------------------------------
 % Heat transfer coefficient is modelled as JET IMPINGEMENT through the
@@ -124,15 +154,15 @@ cover_margin_C      = 60;     % cover setpoint = anneal target + margin
 % simple duct flow). Impingement jets reach realistic h ~ 80-150 W/m^2/K
 % at H2's low density even at modest total fan flow, because the
 % characteristic length (nozzle diameter) is small.
-Q_fan_m3s     = 3.0;          % total circulation fan flow, actual m^3/s at
+Q_fan_m3s      = 3.0;         % total circulation fan flow, actual m^3/s at
                                % furnace operating temperature (split evenly
                                % across the n_coils convector plate zones)
-d_nozzle_m    = 0.03;         % convector plate nozzle/hole diameter
-open_area_frac= 0.04;         % nozzle open area as fraction of coil face area
-P_furnace_Pa  = 1.05*101325;  % slight positive pressure (keeps air out)
-M_H2          = 2.016e-3;     % kg/mol
-Rg            = 8.314;        % J/mol/K
-cp_H2         = 14300;        % J/kg/K (~constant over anneal temp range)
+d_nozzle_m     = 0.03;        % convector plate nozzle/hole diameter
+open_area_frac = 0.04;        % nozzle open area as fraction of coil face area
+P_furnace_Pa   = 1.05*101325; % slight positive pressure (keeps air out)
+M_H2           = 2.016e-3;    % kg/mol
+Rg             = 8.314;       % J/mol/K
+cp_H2          = 14300;       % J/kg/K (~constant over anneal temp range)
 
 % Simple stack-position factor: hearth/burner-side coils tend to run a
 % touch hotter than the top (closer to the cold lid / seal) in a real
@@ -143,9 +173,11 @@ position_factor = linspace(1.05, 0.95, n_coils);
 % --- Radial FD discretisation ------------------------------------------
 Nr = 20;   % radial nodes per coil
 
-% --- Simulation control --------------------------------------------
-t_end_hr  = 60;                 % total simulated cycle time [hours]
-n_out     = 400;                % number of output/report points
+% --- Cycle timing -------------------------------------------------------
+heat_search_hr = 150;   % safety cap: stop the heat-up search if not all
+                        % coils reach target by this time (should not be hit)
+soak_time_hr   = 6;     % hold time once the slowest coil reaches target
+cool_time_hr   = 20;    % simulated cooling duration after soak
 
 %% =====================================================================
 %  4) CHECK STACK HEIGHT FITS THE 7 m FURNACE
@@ -153,68 +185,119 @@ n_out     = 400;                % number of output/report points
 base_stand_m   = 0.5;    % hearth/base stand height
 plate_gap_m    = 0.08;   % convector plate thickness+clearance between coils
 top_clear_m    = 0.8;    % clearance under cover for gas circulation/burner
-stack_height_m = base_stand_m + n_coils*width_m + (n_coils-1)*plate_gap_m + top_clear_m;
+stack_height_m = base_stand_m + sum(width_m) + (n_coils-1)*plate_gap_m + top_clear_m;
 
-fprintf('Stack height required for %d coils of %.0f mm width: %.2f m (furnace = %.1f m)\n', ...
-    n_coils, width_mm, stack_height_m, furnace_height_m);
+fprintf('Stack height required for %d coils (widths as entered): %.2f m (furnace = %.1f m)\n', ...
+    n_coils, stack_height_m, furnace_height_m);
 if stack_height_m > furnace_height_m
-    warning(['Requested coil width leaves the %d-coil stack %.2f m TALLER than the ' ...
-        '7 m furnace. Reduce width or coil count.'], n_coils, stack_height_m-furnace_height_m);
+    warning(['Requested coil widths leave the %d-coil stack %.2f m TALLER than the ' ...
+        '7 m furnace. Reduce widths.'], n_coils, stack_height_m-furnace_height_m);
 else
     fprintf('OK - stack fits with %.2f m clearance.\n\n', furnace_height_m-stack_height_m);
 end
 
 %% =====================================================================
-%  5) BUILD RADIAL CONDUCTION MATRIX (identical for every coil)
+%  5) BUILD PER-COIL RADIAL CONDUCTION MATRICES
+%  (worked per unit axial length - the radial ODE for a uniform coil does
+%   not depend on width, since both capacitance and conduction area scale
+%   linearly with it and the ratio cancels. Width only matters for the
+%   OD-via-mass relation above and for the total heat-exchange AREA used
+%   in the shared cover/gas energy balances further below.)
 %  =====================================================================
-r_edges = linspace(r_ID, r_OD, Nr+1);
-r_cen   = 0.5*(r_edges(1:end-1) + r_edges(2:end));
+A_coil3    = zeros(Nr,Nr,n_coils);
+flux_ratio = zeros(1,n_coils);     % A_outer_face/C_surf per unit length, per coil
+r_cen_all  = zeros(n_coils,Nr);    % radial node centres per coil, for plotting
 
-vol   = pi*(r_edges(2:end).^2 - r_edges(1:end-1).^2) * width_m;  % m^3
-C_th  = rho_steel*cp_steel*vol;                                  % J/K per node
+for c = 1:n_coils
+    r_OD = OD_m(c)/2;
+    r_edges = linspace(r_ID, r_OD, Nr+1);
+    r_cen   = 0.5*(r_edges(1:end-1) + r_edges(2:end));
+    r_cen_all(c,:) = r_cen;
 
-A_face = 2*pi*r_edges(2:end-1)*width_m;   % internal interface areas (Nr-1 of them)
-dr_cen = diff(r_cen);
-G      = k_eff*A_face./dr_cen;            % conductance between node i,i+1 [W/K]
+    vol_pul  = pi*(r_edges(2:end).^2 - r_edges(1:end-1).^2);   % m^2 (per unit length)
+    C_th_pul = rho_steel*cp_steel*vol_pul;                     % J/K per metre
 
-A_coil = zeros(Nr,Nr);
-A_coil(1,1) = -G(1)/C_th(1);
-A_coil(1,2) =  G(1)/C_th(1);
-for i = 2:Nr-1
-    A_coil(i,i-1) =  G(i-1)/C_th(i);
-    A_coil(i,i)   = -(G(i-1)+G(i))/C_th(i);
-    A_coil(i,i+1) =  G(i)/C_th(i);
+    A_face_pul = 2*pi*r_edges(2:end-1);      % internal interface "areas" per unit length
+    dr_cen     = diff(r_cen);
+    G_pul      = k_eff(c)*A_face_pul./dr_cen;
+
+    Ac = zeros(Nr,Nr);
+    Ac(1,1) = -G_pul(1)/C_th_pul(1);
+    Ac(1,2) =  G_pul(1)/C_th_pul(1);
+    for i = 2:Nr-1
+        Ac(i,i-1) =  G_pul(i-1)/C_th_pul(i);
+        Ac(i,i)   = -(G_pul(i-1)+G_pul(i))/C_th_pul(i);
+        Ac(i,i+1) =  G_pul(i)/C_th_pul(i);
+    end
+    Ac(Nr,Nr-1) =  G_pul(Nr-1)/C_th_pul(Nr);
+    Ac(Nr,Nr)   = -G_pul(Nr-1)/C_th_pul(Nr);
+    A_coil3(:,:,c) = Ac;
+
+    A_outer_pul   = 2*pi*r_edges(end);
+    flux_ratio(c) = A_outer_pul/C_th_pul(Nr);
 end
-A_coil(Nr,Nr-1) =  G(Nr-1)/C_th(Nr);
-A_coil(Nr,Nr)   = -G(Nr-1)/C_th(Nr);
-
-A_outer_face = 2*pi*r_edges(end)*width_m;   % coil OD lateral surface area
-C_surf       = C_th(Nr);
 
 %% =====================================================================
-%  6) INITIAL CONDITIONS AND ODE INTEGRATION
+%  6) PARAMETER STRUCT + INITIAL CONDITIONS
 %  =====================================================================
 T0_C = T_amb_C;
 y0 = [T0_C; repmat(T0_C, Nr*n_coils, 1)];
 
-params = struct('Nr',Nr,'n_coils',n_coils,'A_coil',A_coil, ...
-    'A_outer_face',A_outer_face,'C_surf',C_surf,'position_factor',position_factor, ...
+params = struct('Nr',Nr,'n_coils',n_coils,'A_coil3',A_coil3,'flux_ratio',flux_ratio, ...
+    'position_factor',position_factor, ...
     'A_cover',A_cover,'M_cover_kg',M_cover_kg,'Cp_cover',Cp_cover, ...
     'U_loss',U_loss,'A_shell_lat',A_shell_lat,'T_amb_C',T_amb_C, ...
-    'eta_comb',eta_comb,'LHV_mixedgas_kJ_Nm3',LHV_mixedgas_kJ_Nm3, ...
-    'Q_burner_max_kW',Q_burner_max_kW,'Kp_cover',Kp_cover, ...
-    'T_cover_set_C',T_anneal_C+cover_margin_C, ...
+    'eta_comb',eta_comb,'Q_burner_max_kW',Q_burner_max_kW,'Kp_cover',Kp_cover, ...
+    'T_cover_set_C',max(T_anneal_C)+cover_margin_C, ...
+    'T_cover_soak_C',max(T_anneal_C)+soak_margin_C, ...
     'eps_eff',eps_eff,'sigma_SB',sigma_SB, ...
-    'gap_annulus_m',gap_annulus_m,'D_shell_m',D_shell_m,'OD_m',OD_m,'ID_m',coil_ID_m, ...
-    'width_m',width_m,'Q_fan_m3s',Q_fan_m3s,'P_furnace_Pa',P_furnace_Pa, ...
+    'OD_m',OD_m,'ID_m',coil_ID_m,'width_m',width_m, ...
+    'Q_fan_m3s',Q_fan_m3s,'P_furnace_Pa',P_furnace_Pa, ...
     'd_nozzle_m',d_nozzle_m,'open_area_frac',open_area_frac, ...
-    'M_H2',M_H2,'Rg',Rg,'cp_H2',cp_H2);
+    'M_H2',M_H2,'Rg',Rg,'cp_H2',cp_H2, ...
+    'T_anneal_C',T_anneal_C,'tol_C',tol_C,'phase','heat');
 
-t_span = linspace(0, t_end_hr*3600, n_out);
-opts = odeset('RelTol',1e-6,'AbsTol',1e-4);
-[t, Y] = ode15s(@(t,y) furnace_odes(t,y,params), t_span, y0, opts);
+opts_heat = odeset('RelTol',1e-6,'AbsTol',1e-4, ...
+    'Events', @(t,y) all_reached_event(t,y,params));
 
+%% =====================================================================
+%  7) STAGE A - HEAT UP (until slowest coil reaches ITS OWN target)
+%  =====================================================================
+t_span_A = linspace(0, heat_search_hr*3600, 600);
+[tA, YA, teA] = ode15s(@(t,y) furnace_odes(t,y,params), t_span_A, y0, opts_heat);
+if isempty(teA)
+    warning('Not all coils reached target within the %.0f h search horizon - check inputs/parameters.', heat_search_hr);
+end
+
+%% =====================================================================
+%  8) STAGE B - SOAK (hold at temperature for soak_time_hr)
+%  =====================================================================
+params_soak = params;
+params_soak.phase = 'soak';   % lower setpoint - hold steady, don't keep ramping
+t_span_B = linspace(0, soak_time_hr*3600, 150);
+opts_soak = odeset('RelTol',1e-6,'AbsTol',1e-4);
+[tB, YB] = ode15s(@(t,y) furnace_odes(t,y,params_soak), t_span_B, YA(end,:)', opts_soak);
+
+%% =====================================================================
+%  9) STAGE C - COOL (burner off)
+%  =====================================================================
+params_cool = params;
+params_cool.phase = 'cool';
+t_span_C = linspace(0, cool_time_hr*3600, 300);
+opts_cool = odeset('RelTol',1e-6,'AbsTol',1e-4);
+[tC, YC] = ode15s(@(t,y) furnace_odes(t,y,params_cool), t_span_C, YB(end,:)', opts_cool);
+
+%% =====================================================================
+%  10) STITCH THE THREE STAGES INTO ONE FULL-CYCLE TIME HISTORY
+%  =====================================================================
+t_heat_end = tA(end);
+t_soak_end = t_heat_end + tB(end);
+t_total    = t_soak_end + tC(end);
+
+t = [tA; t_heat_end + tB(2:end); t_soak_end + tC(2:end)];
+Y = [YA; YB(2:end,:); YC(2:end,:)];
 t_hr = t/3600;
+
 T_cover = Y(:,1);
 coils   = reshape(Y(:,2:end), length(t), Nr, n_coils);
 T_core  = squeeze(coils(:,1,:));     % innermost node (nearest coil eye)
@@ -225,78 +308,100 @@ T_surf  = squeeze(coils(:,Nr,:));    % outermost node (coil OD)
 T_gas = zeros(size(t));
 Q_fuel_kW = zeros(size(t));
 for k = 1:length(t)
-    [~, T_gas(k)] = gas_temp_and_h(T_cover(k), T_surf(k,:), params);
-    Q_fuel_kW(k) = min(max(params.Kp_cover*(params.T_cover_set_C - T_cover(k)), 0), params.Q_burner_max_kW);
+    if t(k) <= t_heat_end
+        phase_k = 'heat';
+    elseif t(k) <= t_soak_end
+        phase_k = 'soak';
+    else
+        phase_k = 'cool';
+    end
+    pk = params; pk.phase = phase_k;
+    [~, T_gas(k)] = gas_temp_and_h(T_cover(k), T_surf(k,:), pk);
+    switch phase_k
+        case 'cool'
+            Q_fuel_kW(k) = 0;
+        case 'soak'
+            Q_fuel_kW(k) = min(max(pk.Kp_cover*(pk.T_cover_soak_C - T_cover(k)), 0), pk.Q_burner_max_kW);
+        otherwise
+            Q_fuel_kW(k) = min(max(pk.Kp_cover*(pk.T_cover_set_C - T_cover(k)), 0), pk.Q_burner_max_kW);
+    end
 end
 mixedgas_flow_Nm3h = Q_fuel_kW*3600/LHV_mixedgas_kJ_Nm3;      % Nm^3/h
 mixedgas_total_Nm3 = trapz(t, mixedgas_flow_Nm3h/3600);        % Nm^3 over full cycle
 
 %% =====================================================================
-%  7) RESULTS SUMMARY
+%  11) RESULTS SUMMARY
 %  =====================================================================
-tol_C = 5; % consider "at temperature" within 5 C of target
 fprintf('\n--- Results ---\n');
 for c = 1:n_coils
-    idx = find(T_core(:,c) >= T_anneal_C - tol_C, 1, 'first');
+    idx = find(T_core(:,c) >= T_anneal_C(c) - tol_C, 1, 'first');
     if isempty(idx)
-        fprintf('Coil %d (position %d of %d): core did NOT reach target in %.0f h\n', ...
-            c, c, n_coils, t_end_hr);
+        fprintf('Coil %d: core did NOT reach its %.0f C target within the simulated cycle\n', c, T_anneal_C(c));
     else
-        fprintf('Coil %d (position %d of %d): core reaches %.0f C at t = %.1f h (surface was %.0f C)\n', ...
-            c, c, n_coils, T_anneal_C, t_hr(idx), T_surf(idx,c));
+        fprintf('Coil %d: core reaches its %.0f C target at t = %.1f h (surface was %.0f C)\n', ...
+            c, T_anneal_C(c), t_hr(idx), T_surf(idx,c));
     end
 end
-fprintf('\nEffective radial conductivity k_eff = %.3f W/m/K (vs solid steel %.0f W/m/K)\n', k_eff, k_steel);
-fprintf('Coil OD = %.3f m, mass = %.0f kg, width = %.0f mm\n', OD_m, coil_mass_kg, width_mm);
-fprintf('Mixed fuel gas consumed over %.0f h cycle: %.0f Nm^3 (peak firing %.0f kW)\n', ...
-    t_end_hr, mixedgas_total_Nm3, max(Q_fuel_kW));
+fprintf('\nHeat-up complete : %.1f h\n', t_heat_end/3600);
+fprintf('Soak ends        : %.1f h\n', t_soak_end/3600);
+fprintf('Total cycle time : %.1f h (heat %.1f h + soak %.1f h + cool %.1f h)\n', ...
+    t_total/3600, t_heat_end/3600, soak_time_hr, cool_time_hr);
+fprintf('Mixed fuel gas consumed over full cycle: %.0f Nm^3 (peak firing %.0f kW)\n', ...
+    mixedgas_total_Nm3, max(Q_fuel_kW));
 
 %% =====================================================================
-%  8) PLOTS
+%  12) FULL-CYCLE GRAPH (heat + soak + cool, one figure, shared time axis)
 %  =====================================================================
-figure('Name','Furnace & Atmosphere Temperatures','Color','w');
+figure('Name','Full Annealing Cycle','Color','w','Position',[100 100 900 900]);
+
+ax1 = subplot(4,1,1);
 plot(t_hr, T_cover, 'r-', 'LineWidth', 1.8); hold on;
-plot(t_hr, T_gas, 'b-', 'LineWidth', 1.8);
-plot(xlim, [T_anneal_C T_anneal_C], 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
-xlabel('Time [h]'); ylabel('Temperature [C]');
+plot(t_hr, T_gas, 'b-', 'LineWidth', 1.5);
+ylabel('Temp [C]');
 legend('Cover (muffle)','H_2 atmosphere','Location','SouthEast');
-title('Cover and H_2 Atmosphere Temperature'); grid on;
+title('Full Annealing Cycle: Heat-up -> Soak -> Cool'); grid on;
 
-figure('Name','Mixed Fuel Gas Firing Rate','Color','w');
-plot(t_hr, Q_fuel_kW, 'm-', 'LineWidth', 1.8);
-xlabel('Time [h]'); ylabel('Burner firing rate [kW]');
-title('Mixed Fuel Gas Firing Rate (cover temperature controller)'); grid on;
-
-figure('Name','Coil Core & Surface Temperatures','Color','w');
-subplot(2,1,1);
+ax2 = subplot(4,1,2);
 plot(t_hr, T_core, 'LineWidth', 1.5); hold on;
-plot(xlim, [T_anneal_C T_anneal_C], 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
-xlabel('Time [h]'); ylabel('Core temp [C]');
-title('Coil CORE Temperature (innermost radial node) - all 5 stack positions');
-legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), ...
-    'Location','SouthEast');
-grid on;
+for c = 1:n_coils
+    plot(xlim, [T_anneal_C(c) T_anneal_C(c)], '--', 'Color', [0.5 0.5 0.5], 'HandleVisibility','off');
+end
+ylabel('Core temp [C]');
+legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), 'Location','SouthEast');
+title('Coil CORE Temperature (innermost radial node)'); grid on;
 
-subplot(2,1,2);
-plot(t_hr, T_surf, 'LineWidth', 1.5); hold on;
-plot(xlim, [T_anneal_C T_anneal_C], 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
-xlabel('Time [h]'); ylabel('Surface temp [C]');
-title('Coil SURFACE Temperature (outermost radial node)');
-legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), ...
-    'Location','SouthEast');
-grid on;
+ax3 = subplot(4,1,3);
+plot(t_hr, T_surf, 'LineWidth', 1.5);
+ylabel('Surface temp [C]');
+legend(arrayfun(@(c) sprintf('Coil %d',c), 1:n_coils, 'UniformOutput', false), 'Location','SouthEast');
+title('Coil SURFACE Temperature (outermost radial node)'); grid on;
 
-figure('Name','Radial Temperature Profile (Coil 1) at selected times','Color','w');
-snap_hr = [1 5 10 20 30 t_hr(end)];
-snap_hr = snap_hr(snap_hr <= t_hr(end));
+ax4 = subplot(4,1,4);
+plot(t_hr, Q_fuel_kW, 'm-', 'LineWidth', 1.8);
+xlabel('Time [h]'); ylabel('Firing rate [kW]');
+title('Mixed Fuel Gas Firing Rate'); grid on;
+
+for axh = [ax1 ax2 ax3 ax4]
+    yl = get(axh,'YLim');
+    hold(axh,'on');
+    plot(axh, [t_heat_end t_heat_end]/3600, yl, 'k:', 'HandleVisibility','off');
+    plot(axh, [t_soak_end t_soak_end]/3600, yl, 'k:', 'HandleVisibility','off');
+    set(axh,'YLim',yl);
+end
+linkaxes([ax1 ax2 ax3 ax4],'x');
+
+%% =====================================================================
+%  13) SUPPLEMENTARY: RADIAL TEMPERATURE PROFILE, ALL COILS, END OF SOAK
+%  =====================================================================
+figure('Name','Radial Temperature Profile (end of soak)','Color','w');
+[~, k_soak] = min(abs(t_hr - t_soak_end/3600));
 hold on;
-for s = snap_hr
-    [~, k] = min(abs(t_hr - s));
-    plot((r_cen-r_ID)*1000, squeeze(coils(k,:,1)), 'LineWidth',1.5, ...
-        'DisplayName', sprintf('t = %.0f h', t_hr(k)));
+for c = 1:n_coils
+    plot((r_cen_all(c,:)-r_ID)*1000, squeeze(coils(k_soak,:,c)), 'LineWidth',1.5, ...
+        'DisplayName', sprintf('Coil %d (%.2f mm)', c, thickness_mm(c)));
 end
 xlabel('Radial distance from coil ID [mm]'); ylabel('Temperature [C]');
-title('Radial Temperature Profile, Coil 1 (ID -> OD)');
+title('Radial Temperature Profile at End of Soak - all 5 coils');
 legend('Location','SouthEast'); grid on;
 
 %% =====================================================================
@@ -311,11 +416,17 @@ function dydt = furnace_odes(~, y, p)
     [h_conv, T_gas, h_rad] = gas_temp_and_h(T_cover, Tsurf, p);
 
     % --- Cover (muffle) energy balance ---
-    T_set = p.T_cover_set_C;
-    Q_fuel_kW = min(max(p.Kp_cover*(T_set - T_cover), 0), p.Q_burner_max_kW);
+    switch p.phase
+        case 'cool'
+            Q_fuel_kW = 0;
+        case 'soak'
+            Q_fuel_kW = min(max(p.Kp_cover*(p.T_cover_soak_C - T_cover), 0), p.Q_burner_max_kW);
+        otherwise % 'heat'
+            Q_fuel_kW = min(max(p.Kp_cover*(p.T_cover_set_C - T_cover), 0), p.Q_burner_max_kW);
+    end
     Q_in_W = p.eta_comb * Q_fuel_kW * 1000;
 
-    A_lat = pi*p.OD_m*p.width_m;  % per-coil OD lateral area
+    A_lat = pi*p.OD_m.*p.width_m;  % per-coil OD lateral area
     h_cov_gas = h_cover_gas_coeff(p);
     Q_cov_to_gas = h_cov_gas*p.A_cover*(T_cover - T_gas);
 
@@ -328,36 +439,49 @@ function dydt = furnace_odes(~, y, p)
     dcoils_dt = zeros(Nr, nC);
     for c = 1:nC
         flux_OD = h_conv(c)*(T_gas - Tsurf(c)) + h_rad(c)*(T_cover - Tsurf(c)); % W/m^2
-        dTc = p.A_coil * coils(:,c);
-        dTc(Nr) = dTc(Nr) + flux_OD*p.A_outer_face/p.C_surf;
+        dTc = p.A_coil3(:,:,c) * coils(:,c);
+        dTc(Nr) = dTc(Nr) + flux_OD*p.flux_ratio(c);
         dcoils_dt(:,c) = dTc;
     end
 
     dydt = [dTcover_dt; dcoils_dt(:)];
 end
 
+function [value, isterminal, direction] = all_reached_event(~, y, p)
+    Nr = p.Nr; nC = p.n_coils;
+    coils = reshape(y(2:end), Nr, nC);
+    T_core = coils(1,:);
+    value = max(p.T_anneal_C - p.tol_C - T_core);  % >0 until slowest coil catches up
+    isterminal = 1;
+    direction = -1;
+end
+
 function [h_conv, T_gas, h_rad] = gas_temp_and_h(T_cover, Tsurf, p)
     % Quasi-steady H2 atmosphere node + convective/radiative coefficients.
     nC = p.n_coils;
-    A_lat = pi*p.OD_m*p.width_m;
+    A_lat = pi*p.OD_m.*p.width_m;
 
     % --- H2 properties at a first estimate of mean gas temperature ---
     T_guess_K = mean([T_cover; Tsurf(:)]) + 273.15;
     [rho_g, mu_g, k_g] = h2_properties(T_guess_K, p.P_furnace_Pa, p.M_H2, p.Rg);
+    Pr = mu_g*p.cp_H2/k_g;
 
     % Jet impingement through the perforated convector plates: fan flow is
     % split evenly across the n_coils plate zones and forced through small
     % nozzles onto each coil face, giving a high local velocity (and hence
-    % realistic h) even though the overall fan flow is modest.
-    A_face   = pi/4*(p.OD_m^2 - p.ID_m^2);          % coil annular face area
-    A_nozzle = p.open_area_frac * A_face;           % open nozzle area per zone
+    % realistic h) even though the overall fan flow is modest. Each coil
+    % has its own face area (from its own OD), so h_base varies per coil.
     Q_per_coil = p.Q_fan_m3s / nC;
-    v_jet = Q_per_coil / A_nozzle;
-    Re = rho_g*v_jet*p.d_nozzle_m/mu_g;
-    Pr = mu_g*p.cp_H2/k_g;
-    Nu = 0.285*Re^0.6*Pr^(1/3);                     % avg. jet-array impingement
-    h_base = Nu*k_g/p.d_nozzle_m;
-    h_conv = h_base * p.position_factor;            % per-coil convective coeff
+    h_base = zeros(1,nC);
+    for c = 1:nC
+        A_face   = pi/4*(p.OD_m(c)^2 - p.ID_m^2);
+        A_nozzle = p.open_area_frac * A_face;
+        v_jet    = Q_per_coil / A_nozzle;
+        Re       = rho_g*v_jet*p.d_nozzle_m/mu_g;
+        Nu       = 0.285*Re^0.6*Pr^(1/3);       % avg. jet-array impingement
+        h_base(c)= Nu*k_g/p.d_nozzle_m;
+    end
+    h_conv = h_base .* p.position_factor;       % per-coil convective coeff
 
     h_cov_gas = h_cover_gas_coeff(p);
 
