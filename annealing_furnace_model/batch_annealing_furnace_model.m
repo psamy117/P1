@@ -37,6 +37,12 @@
 %  "ADVANCED PARAMETERS" - edit them if you have plant-specific data.
 %
 %  Requires: base MATLAB only (ode15s) - no toolboxes.
+%
+%  Figures are saved to a "furnace_results" folder next to this script
+%  (PNG + editable FIG) and the script pauses at the end waiting for
+%  Enter - this way results survive even if you launch it in a way that
+%  auto-exits MATLAB right after the script finishes (e.g.
+%  matlab -r "run('batch_annealing_furnace_model.m'); exit").
 
 clear; clc; close all;
 
@@ -352,7 +358,7 @@ fprintf('Mixed fuel gas consumed over full cycle: %.0f Nm^3 (peak firing %.0f kW
 %% =====================================================================
 %  12) FULL-CYCLE GRAPH (heat + soak + cool, one figure, shared time axis)
 %  =====================================================================
-figure('Name','Full Annealing Cycle','Color','w','Position',[100 100 900 900]);
+fig1 = figure('Name','Full Annealing Cycle','Color','w','Position',[100 100 900 900]);
 
 ax1 = subplot(4,1,1);
 plot(t_hr, T_cover, 'r-', 'LineWidth', 1.8); hold on;
@@ -393,7 +399,7 @@ linkaxes([ax1 ax2 ax3 ax4],'x');
 %% =====================================================================
 %  13) SUPPLEMENTARY: RADIAL TEMPERATURE PROFILE, ALL COILS, END OF SOAK
 %  =====================================================================
-figure('Name','Radial Temperature Profile (end of soak)','Color','w');
+fig2 = figure('Name','Radial Temperature Profile (end of soak)','Color','w');
 [~, k_soak] = min(abs(t_hr - t_soak_end/3600));
 hold on;
 for c = 1:n_coils
@@ -403,6 +409,25 @@ end
 xlabel('Radial distance from coil ID [mm]'); ylabel('Temperature [C]');
 title('Radial Temperature Profile at End of Soak - all 5 coils');
 legend('Location','SouthEast'); grid on;
+
+%% =====================================================================
+%  14) SAVE FIGURES TO DISK (results survive even if the MATLAB session
+%      is closed/exited automatically right after this script finishes -
+%      e.g. when run as `matlab -r "run('this_script.m'); exit"`)
+%  =====================================================================
+drawnow;
+outdir = fullfile(pwd, 'furnace_results');
+if ~exist(outdir, 'dir'), mkdir(outdir); end
+saveas(fig1, fullfile(outdir, 'full_annealing_cycle.png'));
+saveas(fig2, fullfile(outdir, 'radial_temperature_profile.png'));
+saveas(fig1, fullfile(outdir, 'full_annealing_cycle.fig'));
+saveas(fig2, fullfile(outdir, 'radial_temperature_profile.fig'));
+fprintf('\nFigures saved to: %s\n', outdir);
+
+% Keep the figures on screen: if this script is being run non-interactively
+% (e.g. `matlab -r "run(...); exit"`), MATLAB would otherwise exit and close
+% every figure the instant this script returns. This pause blocks that.
+input('\nPress Enter in this window to close... (figures are already saved to disk above)', 's');
 
 %% =====================================================================
 %  LOCAL FUNCTIONS
