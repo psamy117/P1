@@ -22,15 +22,19 @@
 %      a coil of wound strip - this is what makes strip THICKNESS matter
 %      for the heating rate (thinner strip = more interfaces per metre of
 %      radius = lower effective conductivity = slower core heating).
-%   4) THREE-STAGE cycle: HEAT (burner drives cover to setpoint until the
-%      slowest coil's core reaches ITS OWN target) -> SOAK (hold at
-%      temperature for a fixed dwell) -> COOL (burner off, stack cools
-%      through the same convective/radiative paths).
+%   4) THREE-STAGE cycle: HEAT (burner drives the cover setpoint up at the
+%      requested HEATING RATE, capped at target+margin, until the slowest
+%      coil's core reaches ITS OWN target) -> SOAK (hold at temperature for
+%      a fixed dwell) -> COOL (burner off, stack cools through the same
+%      convective/radiative paths).
 %
 %  EACH of the 5 stacked coils gets its OWN thickness, width and annealing
 %  target - prompted interactively below, coil-by-coil from the furnace
 %  base upward. Furnace height is fixed at 7 m and the stack holds 5 coils,
-%  per the given furnace design.
+%  per the given furnace design. A single furnace-wide HEATING RATE
+%  [deg C/hr] is also requested - it caps how fast the cover setpoint may
+%  ramp during the HEAT stage (all coils share one cover/atmosphere, so
+%  the ramp rate is a shared process parameter, not per-coil).
 %
 %  All other quantities are engineering-typical defaults for a mixed-gas
 %  fired / H2-convection batch annealing furnace and are clearly marked
@@ -85,6 +89,17 @@ for c = 1:n_coils
         c, thickness_mm(c), width_mm(c), T_anneal_C(c));
 end
 fprintf('\n');
+
+% Furnace-wide heating (ramp) rate - one shared process parameter, since all
+% 5 coils sit under the same cover/atmosphere and cannot be ramped
+% independently. This caps how fast the cover setpoint is allowed to climb
+% during the HEAT stage (protects the load from thermal shock / distortion,
+% same as a real batch-anneal recipe's programmed ramp rate).
+default_heating_rate_C_per_hr = 40;
+v = input(sprintf('Furnace heating (ramp) rate [deg C/hr] (default %.0f): ', default_heating_rate_C_per_hr));
+if isempty(v), v = default_heating_rate_C_per_hr; end
+heating_rate_C_per_hr = v;
+fprintf('Heating rate set to %.1f C/hr\n\n', heating_rate_C_per_hr);
 
 thickness_m = thickness_mm/1000;
 width_m     = width_mm/1000;
@@ -261,7 +276,8 @@ params = struct('Nr',Nr,'n_coils',n_coils,'A_coil3',A_coil3,'flux_ratio',flux_ra
     'Q_fan_m3s',Q_fan_m3s,'P_furnace_Pa',P_furnace_Pa, ...
     'd_nozzle_m',d_nozzle_m,'open_area_frac',open_area_frac, ...
     'M_H2',M_H2,'Rg',Rg,'cp_H2',cp_H2, ...
-    'T_anneal_C',T_anneal_C,'tol_C',tol_C,'phase','heat');
+    'T_anneal_C',T_anneal_C,'tol_C',tol_C,'phase','heat', ...
+    'heating_rate_C_per_hr',heating_rate_C_per_hr);
 
 opts_heat = odeset('RelTol',1e-6,'AbsTol',1e-4, ...
     'Events', @(t,y) all_reached_event(t,y,params));
@@ -269,6 +285,12 @@ opts_heat = odeset('RelTol',1e-6,'AbsTol',1e-4, ...
 %% =====================================================================
 %  7) STAGE A - HEAT UP (until slowest coil reaches ITS OWN target)
 %  =====================================================================
+% Extend the search horizon to comfortably cover the ramp time to the
+% cover ceiling plus the usual conduction lag, in case a slow heating
+% rate was requested.
+ramp_time_hr = (params.T_cover_set_C - T_amb_C) / heating_rate_C_per_hr;
+heat_search_hr = max(heat_search_hr, ramp_time_hr + 150);
+
 t_span_A = linspace(0, heat_search_hr*3600, 600);
 [tA, YA, teA] = ode15s(@(t,y) furnace_odes(t,y,params), t_span_A, y0, opts_heat);
 if isempty(teA)
@@ -313,6 +335,7 @@ T_surf  = squeeze(coils(:,Nr,:));    % outermost node (coil OD)
 % functions of the state, not separate ODE states)
 T_gas = zeros(size(t));
 Q_fuel_kW = zeros(size(t));
+T_cover_setpoint = zeros(size(t));   % for plotting the commanded ramp/hold
 for k = 1:length(t)
     if t(k) <= t_heat_end
         phase_k = 'heat';
@@ -326,10 +349,14 @@ for k = 1:length(t)
     switch phase_k
         case 'cool'
             Q_fuel_kW(k) = 0;
+            T_cover_setpoint(k) = NaN;   % burner off - no active setpoint
         case 'soak'
+            T_cover_setpoint(k) = pk.T_cover_soak_C;
             Q_fuel_kW(k) = min(max(pk.Kp_cover*(pk.T_cover_soak_C - T_cover(k)), 0), pk.Q_burner_max_kW);
         otherwise
-            Q_fuel_kW(k) = min(max(pk.Kp_cover*(pk.T_cover_set_C - T_cover(k)), 0), pk.Q_burner_max_kW);
+            T_set_k = min(pk.T_amb_C + pk.heating_rate_C_per_hr*(t(k)/3600), pk.T_cover_set_C);
+            T_cover_setpoint(k) = T_set_k;
+            Q_fuel_kW(k) = min(max(pk.Kp_cover*(T_set_k - T_cover(k)), 0), pk.Q_burner_max_kW);
     end
 end
 mixedgas_flow_Nm3h = Q_fuel_kW*3600/LHV_mixedgas_kJ_Nm3;      % Nm^3/h
@@ -354,6 +381,11 @@ fprintf('Total cycle time : %.1f h (heat %.1f h + soak %.1f h + cool %.1f h)\n',
     t_total/3600, t_heat_end/3600, soak_time_hr, cool_time_hr);
 fprintf('Mixed fuel gas consumed over full cycle: %.0f Nm^3 (peak firing %.0f kW)\n', ...
     mixedgas_total_Nm3, max(Q_fuel_kW));
+fprintf('\nRequested furnace heating rate : %.1f C/hr (caps the cover setpoint ramp)\n', heating_rate_C_per_hr);
+for c = 1:n_coils
+    fprintf('Coil %d effective avg. core heating rate: %.1f C/hr (limited by radial conduction, not just the ramp)\n', ...
+        c, (T_anneal_C(c)-T_amb_C)/(t_heat_end/3600));
+end
 
 %% =====================================================================
 %  12) FULL-CYCLE GRAPH (heat + soak + cool, one figure, shared time axis)
@@ -363,8 +395,9 @@ fig1 = figure('Name','Full Annealing Cycle','Color','w','Position',[100 100 900 
 ax1 = subplot(4,1,1);
 plot(t_hr, T_cover, 'r-', 'LineWidth', 1.8); hold on;
 plot(t_hr, T_gas, 'b-', 'LineWidth', 1.5);
+plot(t_hr, T_cover_setpoint, 'k--', 'LineWidth', 1);
 ylabel('Temp [C]');
-legend('Cover (muffle)','H_2 atmosphere','Location','SouthEast');
+legend('Cover (muffle)','H_2 atmosphere','Cover setpoint (ramp)','Location','SouthEast');
 title('Full Annealing Cycle: Heat-up -> Soak -> Cool'); grid on;
 
 ax2 = subplot(4,1,2);
@@ -432,7 +465,7 @@ input('\nPress Enter in this window to close... (figures are already saved to di
 %% =====================================================================
 %  LOCAL FUNCTIONS
 %  =====================================================================
-function dydt = furnace_odes(~, y, p)
+function dydt = furnace_odes(t, y, p)
     Nr = p.Nr; nC = p.n_coils;
     T_cover = y(1);
     coils = reshape(y(2:end), Nr, nC);
@@ -446,8 +479,11 @@ function dydt = furnace_odes(~, y, p)
             Q_fuel_kW = 0;
         case 'soak'
             Q_fuel_kW = min(max(p.Kp_cover*(p.T_cover_soak_C - T_cover), 0), p.Q_burner_max_kW);
-        otherwise % 'heat'
-            Q_fuel_kW = min(max(p.Kp_cover*(p.T_cover_set_C - T_cover), 0), p.Q_burner_max_kW);
+        otherwise % 'heat' - cover setpoint RAMPS at the requested heating
+                  % rate up to the ceiling (target + margin), instead of
+                  % jumping straight to the ceiling
+            T_set = min(p.T_amb_C + p.heating_rate_C_per_hr*(t/3600), p.T_cover_set_C);
+            Q_fuel_kW = min(max(p.Kp_cover*(T_set - T_cover), 0), p.Q_burner_max_kW);
     end
     Q_in_W = p.eta_comb * Q_fuel_kW * 1000;
 
